@@ -249,6 +249,18 @@ def _ensure_scheduler() -> None:
     _scheduler_thread.start()
 
 
+def _claim_scheduler_if_available() -> bool:
+    global _owns_scheduler_lock
+    if _owns_scheduler_lock:
+        _ensure_scheduler()
+        return True
+    if not _try_acquire_scheduler_lock():
+        return False
+    _owns_scheduler_lock = True
+    _ensure_scheduler()
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Hook: capture gateway runner, loop, and routing
 # ---------------------------------------------------------------------------
@@ -267,7 +279,7 @@ def _capture_gateway(**kwargs: Any) -> None:
                 _gateway_loop = asyncio.get_event_loop()
             except RuntimeError:
                 _gateway_loop = None
-        _ensure_scheduler()
+        _claim_scheduler_if_available()
         logger.info("heartbeat: captured gateway runner")
 
     if _pinned_routing is not None:
@@ -324,6 +336,10 @@ def heartbeat_watch_tool(
     else:
         if not command.strip():
             return json.dumps({"error": "command is required for command watches (or pass seconds>0 for a timer)"})
+        if command.strip().split(maxsplit=1)[0].startswith("mcp__"):
+            return json.dumps(
+                {"error": "command must be a shell command, not an MCP tool name; use a real executable or script"}
+            )
         watch = {
             "type": "command",
             "command": command,
@@ -500,9 +516,7 @@ def register(ctx: Any) -> None:
         _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
-    if _try_acquire_scheduler_lock():
-        _owns_scheduler_lock = True
-        _ensure_scheduler()
+    if _claim_scheduler_if_available():
         logger.info("heartbeat plugin registered (scheduler owner)")
     else:
         logger.info("heartbeat plugin registered (scheduler owned elsewhere)")

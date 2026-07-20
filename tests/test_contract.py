@@ -240,6 +240,61 @@ def test_scheduler_not_armed_without_lock() -> None:
     assert plugin._scheduler_thread is None
 
 
+def test_gateway_capture_retries_scheduler_lock_after_register_miss(monkeypatch: Any) -> None:
+    # Given: registration happens before this process can own the scheduler lock.
+    lock_results = iter([False, True])
+    ensure_calls = 0
+
+    def _try_lock() -> bool:
+        return next(lock_results)
+
+    def _record_ensure() -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+
+    monkeypatch.setattr(plugin, "_try_acquire_scheduler_lock", _try_lock)
+    monkeypatch.setattr(plugin, "_ensure_scheduler", _record_ensure)
+
+    class Ctx:
+        def register_tool(self, **kwargs: Any) -> None:
+            pass
+
+        def register_hook(self, hook_name: str, callback: Any) -> None:
+            pass
+
+    register(Ctx())
+    assert plugin._owns_scheduler_lock is False
+
+    # When: the gateway is later captured and the lock is now available.
+    plugin._capture_gateway(gateway=object(), event=None)
+
+    # Then: this process becomes the scheduler owner and arms it.
+    assert plugin._owns_scheduler_lock is True
+    assert ensure_calls == 1
+
+
+def test_command_watch_rejects_mcp_tool_name_as_shell_command(tmp_path: Path, monkeypatch: Any) -> None:
+    # Given: an isolated state directory.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    # When: a command watch is created with an MCP tool name instead of a shell command.
+    import json
+
+    result = json.loads(
+        heartbeat_watch_tool(
+            name="bad",
+            command="mcp__opencode__opencode_check session-id",
+            interval=30,
+        )
+    )
+
+    # Then: the invalid watch is rejected before it can stall the scheduler.
+    assert result == {
+        "error": "command must be a shell command, not an MCP tool name; use a real executable or script"
+    }
+    assert json.loads(heartbeat_list_tool()) == {"watches": [], "count": 0}
+
+
 def test_routing_is_sticky_first_capture() -> None:
     # Given: two incoming messages from different conversations.
     first = SimpleNamespace(
