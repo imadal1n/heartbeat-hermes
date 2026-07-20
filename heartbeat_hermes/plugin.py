@@ -199,24 +199,38 @@ def evaluate_watch(
 def _scheduler_loop() -> None:
     logger.info("heartbeat: scheduler started")
     while not _scheduler_stop.is_set():
+        now = time.time()
         with _state_lock:
-            now = time.time()
             watches = _load_watches()
-            dirty = False
-            for name in list(watches):
-                watch = watches.get(name)
+            due_watches = []
+            for name, watch in watches.items():
                 if not isinstance(watch, dict) or not watch.get("enabled", True):
                     continue
                 if now < float(watch.get("next_run", 0)):
                     continue
-                outcome = evaluate_watch(name, watch, now)
-                if outcome == "remove":
-                    del watches[name]
-                else:
-                    watch["next_run"] = now + float(watch.get("interval", 60))
-                dirty = True
-            if dirty:
-                _save_watches_locked(watches)
+                due_watches.append((name, dict(watch)))
+
+        evaluated = []
+        for name, original_watch in due_watches:
+            watch = dict(original_watch)
+            outcome = evaluate_watch(name, watch, now)
+            evaluated.append((name, original_watch, watch, outcome))
+
+        if evaluated:
+            with _state_lock:
+                watches = _load_watches()
+                dirty = False
+                for name, original_watch, watch, outcome in evaluated:
+                    if watches.get(name) != original_watch:
+                        continue
+                    if outcome == "remove":
+                        del watches[name]
+                    else:
+                        watch["next_run"] = now + float(watch.get("interval", 60))
+                        watches[name] = watch
+                    dirty = True
+                if dirty:
+                    _save_watches_locked(watches)
         _scheduler_stop.wait(POLL_SECONDS)
     logger.info("heartbeat: scheduler stopped")
 

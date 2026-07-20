@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,6 +18,7 @@ from heartbeat_hermes.plugin import (
     heartbeat_list_tool,
     heartbeat_watch_tool,
     heartbeat_unwatch_tool,
+    _run_check,
     register,
 )
 
@@ -200,6 +204,65 @@ def test_command_watch_once_removes_after_fire() -> None:
 
     # Then: it is removed.
     assert outcome == "remove"
+
+
+def test_run_check_timeout_kills_shell_children() -> None:
+    # Given: a shell command whose child would outlive the shell if only the shell is killed.
+    marker = f"heartbeat-orphan-timeout-test-{os.getpid()}"
+    command = f"sh -c 'exec -a {marker} sleep 47'"
+
+    try:
+        # When: the command exceeds the heartbeat timeout.
+        output = _run_check(command, 0.1)
+
+        # Then: no finding is emitted and the child process is gone too.
+        assert output == ""
+        time.sleep(0.2)
+        result = subprocess.run(
+            ["pgrep", "-f", marker],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+    finally:
+        subprocess.run(["pkill", "-f", marker], check=False)
+
+
+def test_scheduler_does_not_hold_state_lock_while_check_runs(tmp_path: Path, monkeypatch: Any) -> None:
+    # Given: a due watch whose evaluation blocks.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    heartbeat_watch_tool(name="slow", command="sleep", interval=30)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_evaluate(name: str, watch: dict[str, Any], now: float) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "pending"
+
+    monkeypatch.setattr(plugin, "evaluate_watch", _blocking_evaluate)
+    monkeypatch.setattr(plugin, "POLL_SECONDS", 0.05)
+    plugin._scheduler_stop.clear()
+    scheduler = threading.Thread(target=plugin._scheduler_loop, daemon=True)
+    scheduler.start()
+    assert started.wait(timeout=1)
+
+    try:
+        # When: another tool call updates watches while the check is still running.
+        writer = threading.Thread(
+            target=lambda: heartbeat_watch_tool(name="new", command="true", interval=30),
+            daemon=True,
+        )
+        writer.start()
+        writer.join(timeout=0.2)
+
+        # Then: the write is not blocked by the running check.
+        assert not writer.is_alive()
+    finally:
+        release.set()
+        plugin._scheduler_stop.set()
+        scheduler.join(timeout=1)
 
 
 def test_watch_tools_roundtrip(tmp_path: Path, monkeypatch: Any) -> None:
