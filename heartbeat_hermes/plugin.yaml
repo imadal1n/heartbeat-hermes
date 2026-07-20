@@ -1,0 +1,6 @@
+name: heartbeat-hermes
+version: "0.1.0"
+description: "Generic wake-on-done watcher: timers and check commands for any task that can produce a done. Wakes the agent in its main session via a synthetic internal event; the plugin never posts to chat itself."
+author: "heartbeat-hermes contributors"
+hooks:
+  - pre_gateway_dispatch

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "heartbeat-hermes"
+version = "0.1.0"
+description = "Generic wake-on-done watcher plugin for Hermes Agent"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["heartbeat_hermes"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
