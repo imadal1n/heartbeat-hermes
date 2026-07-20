@@ -211,6 +211,19 @@ def test_run_check_timeout_kills_shell_children() -> None:
     marker = f"heartbeat-orphan-timeout-test-{os.getpid()}"
     command = f"sh -c 'exec -a {marker} sleep 47'"
 
+    def _marker_pids() -> list[int]:
+        pids: list[int] = []
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdecimal():
+                continue
+            try:
+                cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+            except OSError:
+                continue
+            if marker in cmdline:
+                pids.append(int(proc.name))
+        return pids
+
     try:
         # When: the command exceeds the heartbeat timeout.
         output = _run_check(command, 0.1)
@@ -218,22 +231,10 @@ def test_run_check_timeout_kills_shell_children() -> None:
         # Then: no finding is emitted and the child process is gone too.
         assert output == ""
         time.sleep(0.2)
-        result = subprocess.run(
-            ["pgrep", "-f", marker],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 1
+        assert _marker_pids() == []
     finally:
-        result = subprocess.run(
-            ["pgrep", "-f", marker],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        for pid in result.stdout.split():
-            os.kill(int(pid), 15)
+        for pid in _marker_pids():
+            os.kill(pid, 15)
 
 
 def test_scheduler_does_not_hold_state_lock_while_check_runs(tmp_path: Path, monkeypatch: Any) -> None:
