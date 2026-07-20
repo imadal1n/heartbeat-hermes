@@ -311,9 +311,35 @@ def test_scheduler_not_armed_without_lock() -> None:
     assert plugin._scheduler_thread is None
 
 
+def test_register_does_not_claim_scheduler_before_gateway_capture(monkeypatch: Any) -> None:
+    # Given: registration happens in a process without a captured gateway runner.
+    ensure_calls = 0
+
+    def _record_ensure() -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+
+    monkeypatch.setattr(plugin, "_try_acquire_scheduler_lock", lambda: True)
+    monkeypatch.setattr(plugin, "_ensure_scheduler", _record_ensure)
+
+    class Ctx:
+        def register_tool(self, **kwargs: Any) -> None:
+            pass
+
+        def register_hook(self, hook_name: str, callback: Any) -> None:
+            pass
+
+    # When: the plugin registers its tools and hooks.
+    register(Ctx())
+
+    # Then: it does not steal the singleton scheduler lock before gateway capture.
+    assert plugin._owns_scheduler_lock is False
+    assert ensure_calls == 0
+
+
 def test_gateway_capture_retries_scheduler_lock_after_register_miss(monkeypatch: Any) -> None:
     # Given: registration happens before this process can own the scheduler lock.
-    lock_results = iter([False, True])
+    lock_results = iter([True])
     ensure_calls = 0
 
     def _try_lock() -> bool:

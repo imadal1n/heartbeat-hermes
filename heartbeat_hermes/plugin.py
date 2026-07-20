@@ -524,13 +524,10 @@ def _load_pinned_routing() -> Optional[Dict[str, Any]]:
 
 def register(ctx: Any) -> None:
     """Register heartbeat tools and the gateway-capture hook."""
-    global _owns_scheduler_lock, _pinned_routing, _routing
+    global _pinned_routing, _routing
     _pinned_routing = _load_pinned_routing()
     if _pinned_routing is not None:
         _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
-    if _claim_scheduler_if_available():
-        logger.info("heartbeat plugin registered (scheduler owner)")
-    else:
-        logger.info("heartbeat plugin registered (scheduler owned elsewhere)")
+    logger.info("heartbeat plugin registered")
