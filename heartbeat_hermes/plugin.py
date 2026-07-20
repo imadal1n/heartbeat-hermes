@@ -174,9 +174,12 @@ def evaluate_watch(
         if now < float(watch.get("deadline", 0)):
             return "pending"
         note = str(watch.get("note") or f"Timer '{name}' expired.")
-        if wake(f"[heartbeat: {name}] {note}"):
-            return "remove"
-        return "pending"
+        if not wake(f"[heartbeat: {name}] {note}"):
+            return "pending"
+        if watch.get("repeat"):
+            watch["deadline"] = now + float(watch.get("seconds", 60))
+            return "fired"
+        return "remove"
 
     finding = runner(str(watch.get("command", "")), float(watch.get("timeout", COMMAND_TIMEOUT_SECONDS)))
     if not finding:
@@ -290,6 +293,7 @@ def heartbeat_watch_tool(
     seconds: float = 0,
     note: str = "",
     once: bool = False,
+    repeat: bool = False,
 ) -> str:
     if not name or not name.strip():
         return json.dumps({"error": "name is required"})
@@ -300,8 +304,10 @@ def heartbeat_watch_tool(
         watch: Dict[str, Any] = {
             "type": "timer",
             "deadline": now + float(seconds),
+            "seconds": float(seconds),
             "interval": max(TIMER_MIN_INTERVAL, min(60, float(seconds) / 10)),
             "note": note or f"Timer '{name}' expired.",
+            "repeat": bool(repeat),
             "enabled": True,
             "next_run": now,
         }
@@ -367,6 +373,7 @@ def _register_tools(register_tool: Callable[..., Any]) -> None:
             seconds=args.get("seconds", 0),
             note=args.get("note", ""),
             once=args.get("once", False),
+            repeat=args.get("repeat", False),
         ),
         schema={
             "name": "heartbeat_watch",
@@ -396,6 +403,10 @@ def _register_tools(register_tool: Callable[..., Any]) -> None:
                     "once": {
                         "type": "boolean",
                         "description": "Remove a command watch after its first fire (default false).",
+                    },
+                    "repeat": {
+                        "type": "boolean",
+                        "description": "Re-arm a timer after each fire instead of removing it (default false).",
                     },
                 },
                 "required": ["name"],

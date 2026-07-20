@@ -113,11 +113,26 @@ def test_timer_watch_pending_before_deadline() -> None:
     watch = {"type": "timer", "deadline": time.time() + 3600}
 
     # When: the watch is evaluated.
-    outcome = evaluate_watch("later", watch, time.time(), wake=_recorder(fired))
+    outcome = evaluate_watch("later", watch, time.time(), wake=fired.append)
 
     # Then: nothing fires.
     assert outcome == "pending"
     assert fired == []
+
+
+def test_repeating_timer_rearms_after_fire() -> None:
+    # Given: a repeating timer past its deadline.
+    fired: list[str] = []
+    now = time.time()
+    watch = {"type": "timer", "deadline": now - 1, "seconds": 480, "repeat": True, "note": "egg done"}
+
+    # When: it fires.
+    outcome = evaluate_watch("egg", watch, now, wake=_recorder(fired))
+
+    # Then: it stays armed with a fresh deadline instead of being removed.
+    assert outcome == "fired"
+    assert fired == ["[heartbeat: egg] egg done"]
+    assert watch["deadline"] > now + 400
 
 
 def test_command_watch_silent_on_empty_output() -> None:
