@@ -43,6 +43,8 @@ LOCK_FILENAME = "scheduler.lock"
 _gateway_runner: Any = None
 _gateway_loop: Any = None
 _routing: Optional[Dict[str, Any]] = None
+_pinned_routing: Optional[Dict[str, Any]] = None
+_owns_scheduler_lock = False
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_stop = threading.Event()
 _scheduler_lock_fd: Any = None
@@ -234,6 +236,8 @@ def _try_acquire_scheduler_lock() -> bool:
 
 def _ensure_scheduler() -> None:
     global _scheduler_thread
+    if not _owns_scheduler_lock:
+        return
     if _scheduler_thread and _scheduler_thread.is_alive():
         return
     _scheduler_stop.clear()
@@ -264,11 +268,17 @@ def _capture_gateway(**kwargs: Any) -> None:
             except RuntimeError:
                 _gateway_loop = None
         _ensure_scheduler()
-        logger.info("heartbeat: captured gateway runner, scheduler armed")
+        logger.info("heartbeat: captured gateway runner")
+
+    if _pinned_routing is not None:
+        _routing = _pinned_routing
+        return None
 
     event = kwargs.get("event")
     source = getattr(event, "source", None)
     if source is None:
+        return None
+    if _routing is not None:
         return None
     platform = getattr(source, "platform", None)
     _routing = {
@@ -451,11 +461,47 @@ def _register_tools(register_tool: Callable[..., Any]) -> None:
     )
 
 
+def _load_pinned_routing() -> Optional[Dict[str, Any]]:
+    """Resolve an explicit wake target from config.yaml or env, if any.
+
+    Keys under ``plugins.entries.heartbeat-hermes`` (or the matching env
+    vars): ``deliver_platform``, ``deliver_chat_id``, ``deliver_chat_type``,
+    ``deliver_thread_id``. When unset, the wake target is the first
+    conversation the gateway routes through the plugin.
+    """
+    cfg: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config() or {}).get("plugins", {}).get("entries", {}).get("heartbeat-hermes", {})
+        if isinstance(raw, dict):
+            cfg = raw
+    except Exception:
+        cfg = {}
+
+    platform = os.environ.get("HEARTBEAT_DELIVER_PLATFORM") or cfg.get("deliver_platform")
+    chat_id = os.environ.get("HEARTBEAT_DELIVER_CHAT_ID") or cfg.get("deliver_chat_id")
+    if not platform or not chat_id:
+        return None
+    return {
+        "platform": str(platform),
+        "chat_id": str(chat_id),
+        "chat_name": cfg.get("deliver_chat_name"),
+        "chat_type": str(cfg.get("deliver_chat_type", "dm")),
+        "thread_id": cfg.get("deliver_thread_id"),
+    }
+
+
 def register(ctx: Any) -> None:
     """Register heartbeat tools and the gateway-capture hook."""
+    global _owns_scheduler_lock, _pinned_routing, _routing
+    _pinned_routing = _load_pinned_routing()
+    if _pinned_routing is not None:
+        _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
     if _try_acquire_scheduler_lock():
+        _owns_scheduler_lock = True
         _ensure_scheduler()
         logger.info("heartbeat plugin registered (scheduler owner)")
     else:

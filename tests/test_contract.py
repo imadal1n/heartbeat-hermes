@@ -4,9 +4,12 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import pytest
+
+import heartbeat_hermes.plugin as plugin
 from heartbeat_hermes.plugin import (
     evaluate_watch,
     heartbeat_list_tool,
@@ -14,6 +17,32 @@ from heartbeat_hermes.plugin import (
     heartbeat_unwatch_tool,
     register,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_plugin_state(monkeypatch: Any) -> Any:
+    snapshot = {
+        name: getattr(plugin, name)
+        for name in (
+            "_gateway_runner",
+            "_gateway_loop",
+            "_routing",
+            "_pinned_routing",
+            "_owns_scheduler_lock",
+            "_scheduler_thread",
+        )
+    }
+    plugin._gateway_runner = None
+    plugin._gateway_loop = None
+    plugin._routing = None
+    plugin._pinned_routing = None
+    plugin._owns_scheduler_lock = False
+    plugin._scheduler_thread = None
+    monkeypatch.setattr(plugin, "_try_acquire_scheduler_lock", lambda: False)
+    yield
+    for name, value in snapshot.items():
+        setattr(plugin, name, value)
+
 
 def _recorder(fired: list) -> Any:
     def _wake(text: str) -> bool:
@@ -190,6 +219,74 @@ def test_watch_tools_roundtrip(tmp_path: Path, monkeypatch: Any) -> None:
     assert kinds == {"egg": "timer", "job": "command"}
     heartbeat_unwatch_tool("egg")
     assert json.loads(heartbeat_list_tool())["count"] == 1
+
+
+def test_scheduler_not_armed_without_lock() -> None:
+    # Given: a plugin registered while another process owns the scheduler lock.
+    class Ctx:
+        def register_tool(self, **kwargs: Any) -> None:
+            pass
+
+        def register_hook(self, hook_name: str, callback: Any) -> None:
+            pass
+
+    register(Ctx())
+
+    # When: the gateway-capture hook fires on an incoming message.
+    plugin._capture_gateway(gateway=object(), event=None)
+
+    # Then: no scheduler thread starts in this process.
+    assert plugin._owns_scheduler_lock is False
+    assert plugin._scheduler_thread is None
+
+
+def test_routing_is_sticky_first_capture() -> None:
+    # Given: two incoming messages from different conversations.
+    first = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="telegram", chat_id="room-a", chat_name=None, chat_type="group", thread_id=None
+        )
+    )
+    second = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="telegram", chat_id="room-b", chat_name=None, chat_type="group", thread_id=None
+        )
+    )
+
+    # When: the capture hook sees both.
+    plugin._capture_gateway(gateway=None, event=first)
+    plugin._capture_gateway(gateway=None, event=second)
+
+    # Then: the wake target stays the first conversation, not the last.
+    assert plugin._routing is not None
+    assert plugin._routing["chat_id"] == "room-a"
+
+
+def test_pinned_routing_from_env_overrides_capture(monkeypatch: Any) -> None:
+    # Given: an explicit wake target pinned via env and a later message from elsewhere.
+    monkeypatch.setenv("HEARTBEAT_DELIVER_PLATFORM", "telegram")
+    monkeypatch.setenv("HEARTBEAT_DELIVER_CHAT_ID", "pinned-room")
+
+    class Ctx:
+        def register_tool(self, **kwargs: Any) -> None:
+            pass
+
+        def register_hook(self, hook_name: str, callback: Any) -> None:
+            pass
+
+    register(Ctx())
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="telegram", chat_id="other-room", chat_name=None, chat_type="dm", thread_id=None
+        )
+    )
+
+    # When: the capture hook sees the message.
+    plugin._capture_gateway(gateway=None, event=event)
+
+    # Then: the pinned target wins.
+    assert plugin._routing is not None
+    assert plugin._routing["chat_id"] == "pinned-room"
 
 
 def test_concurrent_watch_writes_do_not_crash(tmp_path: Path, monkeypatch: Any) -> None:
