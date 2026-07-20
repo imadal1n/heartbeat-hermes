@@ -177,6 +177,34 @@ def test_watch_tools_roundtrip(tmp_path: Path, monkeypatch: Any) -> None:
     assert json.loads(heartbeat_list_tool())["count"] == 1
 
 
+def test_concurrent_watch_writes_do_not_crash(tmp_path: Path, monkeypatch: Any) -> None:
+    # Given: many threads writing watches concurrently against one state file.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import threading
+
+    errors: list[Exception] = []
+
+    def _writer(i: int) -> None:
+        try:
+            heartbeat_watch_tool(name=f"w{i}", command=f"echo {i}", interval=30)
+        except Exception as exc:  # noqa: BLE001 - test records any failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(20)]
+
+    # When: they all write at once.
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Then: no write crashes and every watch survives.
+    import json
+
+    assert errors == []
+    assert json.loads(heartbeat_list_tool())["count"] == 20
+
+
 def test_public_files_do_not_leak_local_operational_data() -> None:
     # Given: files intended for a public repository.
     public_files = [

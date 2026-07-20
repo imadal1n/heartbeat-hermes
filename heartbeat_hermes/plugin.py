@@ -46,6 +46,7 @@ _routing: Optional[Dict[str, Any]] = None
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_stop = threading.Event()
 _scheduler_lock_fd: Any = None
+_state_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +69,8 @@ def _load_watches() -> Dict[str, Dict[str, Any]]:
     return data if isinstance(data, dict) else {}
 
 
-def _save_watches(watches: Dict[str, Dict[str, Any]]) -> None:
+def _save_watches_locked(watches: Dict[str, Dict[str, Any]]) -> None:
+    """Write watches atomically. Caller must hold ``_state_lock``."""
     target = _state_dir() / WATCHES_FILENAME
     tmp = target.with_suffix(".tmp")
     tmp.write_text(json.dumps(watches, indent=2), encoding="utf-8")
@@ -192,23 +194,24 @@ def evaluate_watch(
 def _scheduler_loop() -> None:
     logger.info("heartbeat: scheduler started")
     while not _scheduler_stop.is_set():
-        now = time.time()
-        watches = _load_watches()
-        dirty = False
-        for name in list(watches):
-            watch = watches.get(name)
-            if not isinstance(watch, dict) or not watch.get("enabled", True):
-                continue
-            if now < float(watch.get("next_run", 0)):
-                continue
-            outcome = evaluate_watch(name, watch, now)
-            if outcome == "remove":
-                del watches[name]
-            else:
-                watch["next_run"] = now + float(watch.get("interval", 60))
-            dirty = True
-        if dirty:
-            _save_watches(watches)
+        with _state_lock:
+            now = time.time()
+            watches = _load_watches()
+            dirty = False
+            for name in list(watches):
+                watch = watches.get(name)
+                if not isinstance(watch, dict) or not watch.get("enabled", True):
+                    continue
+                if now < float(watch.get("next_run", 0)):
+                    continue
+                outcome = evaluate_watch(name, watch, now)
+                if outcome == "remove":
+                    del watches[name]
+                else:
+                    watch["next_run"] = now + float(watch.get("interval", 60))
+                dirty = True
+            if dirty:
+                _save_watches_locked(watches)
         _scheduler_stop.wait(POLL_SECONDS)
     logger.info("heartbeat: scheduler stopped")
 
@@ -291,7 +294,6 @@ def heartbeat_watch_tool(
     if not name or not name.strip():
         return json.dumps({"error": "name is required"})
     name = name.strip()
-    watches = _load_watches()
     now = time.time()
 
     if seconds and seconds > 0:
@@ -315,18 +317,21 @@ def heartbeat_watch_tool(
             "enabled": True,
             "next_run": now,
         }
-    watches[name] = watch
-    _save_watches(watches)
+    with _state_lock:
+        watches = _load_watches()
+        watches[name] = watch
+        _save_watches_locked(watches)
     _ensure_scheduler()
     return json.dumps({"status": "watching", "name": name, "watch": watch})
 
 
 def heartbeat_unwatch_tool(name: str) -> str:
-    watches = _load_watches()
-    if name not in watches:
-        return json.dumps({"error": f"watch '{name}' not found"})
-    del watches[name]
-    _save_watches(watches)
+    with _state_lock:
+        watches = _load_watches()
+        if name not in watches:
+            return json.dumps({"error": f"watch '{name}' not found"})
+        del watches[name]
+        _save_watches_locked(watches)
     return json.dumps({"status": "removed", "name": name})
 
 
