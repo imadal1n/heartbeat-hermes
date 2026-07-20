@@ -226,7 +226,14 @@ def test_run_check_timeout_kills_shell_children() -> None:
         )
         assert result.returncode == 1
     finally:
-        subprocess.run(["pkill", "-f", marker], check=False)
+        result = subprocess.run(
+            ["pgrep", "-f", marker],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for pid in result.stdout.split():
+            os.kill(int(pid), 15)
 
 
 def test_scheduler_does_not_hold_state_lock_while_check_runs(tmp_path: Path, monkeypatch: Any) -> None:
