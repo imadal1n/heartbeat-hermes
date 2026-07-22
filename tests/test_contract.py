@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -59,6 +58,77 @@ def _recorder(fired: list) -> Any:
 PACKAGE = Path(__file__).resolve().parents[1] / "heartbeat_hermes"
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_TOOLS = ["heartbeat_watch", "heartbeat_unwatch", "heartbeat_list"]
+
+
+class _FakePlatformValue:
+    value = "matrix"
+
+
+class _FakePlatform:
+    MATRIX = _FakePlatformValue()
+
+    def __new__(cls, value: str) -> _FakePlatformValue:
+        if value != "matrix":
+            raise ValueError(value)
+        return cls.MATRIX
+
+
+class _FakeSessionSource:
+    def __init__(
+        self,
+        *,
+        platform: _FakePlatformValue,
+        chat_id: str,
+        chat_name: str | None,
+        chat_type: str,
+        user_id: str,
+        user_name: str,
+        thread_id: str | None,
+    ) -> None:
+        self.platform = platform
+        self.chat_id = chat_id
+        self.chat_name = chat_name
+        self.chat_type = chat_type
+        self.user_id = user_id
+        self.user_name = user_name
+        self.thread_id = thread_id
+
+
+class _FakeMessageEvent:
+    def __init__(
+        self,
+        *,
+        text: str,
+        message_type: str,
+        source: _FakeSessionSource,
+        internal: bool,
+    ) -> None:
+        self.text = text
+        self.message_type = message_type
+        self.source = source
+        self.internal = internal
+
+
+def _install_fake_gateway_modules(monkeypatch: Any) -> None:
+    monkeypatch.setitem(sys.modules, "gateway", ModuleType("gateway"))
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.config",
+        SimpleNamespace(Platform=_FakePlatform),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.platforms.base",
+        SimpleNamespace(
+            MessageEvent=_FakeMessageEvent,
+            MessageType=SimpleNamespace(TEXT="text"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.session",
+        SimpleNamespace(SessionSource=_FakeSessionSource),
+    )
 
 
 def test_manifest_declares_exact_tools_and_hook() -> None:
@@ -368,6 +438,82 @@ def test_gateway_capture_retries_scheduler_lock_after_register_miss(monkeypatch:
     # Then: this process becomes the scheduler owner and arms it.
     assert plugin._owns_scheduler_lock is True
     assert ensure_calls == 1
+
+
+def test_inject_wake_dispatches_internal_event_through_gateway_runner(monkeypatch: Any) -> None:
+    # Given: a captured Matrix route with a platform adapter whose busy path must be bypassed.
+    _install_fake_gateway_modules(monkeypatch)
+    handled: list[_FakeMessageEvent] = []
+    sent: list[dict[str, str]] = []
+
+    class Adapter:
+        async def handle_message(self, event: _FakeMessageEvent) -> None:
+            raise AssertionError("synthetic heartbeat wake used adapter busy path")
+
+        async def send(self, *, chat_id: str, content: str, metadata: Any = None) -> Any:
+            sent.append({"chat_id": chat_id, "content": content})
+            return SimpleNamespace(success=True)
+
+    class Runner:
+        def __init__(self) -> None:
+            self.adapters = {_FakePlatform.MATRIX: Adapter()}
+
+        async def _handle_message(self, event: _FakeMessageEvent) -> str:
+            handled.append(event)
+            return "wake accepted"
+
+    class ImmediateFuture:
+        def __init__(self, result: Any) -> None:
+            self._result = result
+
+        def result(self, timeout: float) -> Any:
+            return self._result
+
+    def run_now(coro: Any, loop: Any) -> ImmediateFuture:
+        return ImmediateFuture(plugin.asyncio.run(coro))
+
+    monkeypatch.setattr(plugin.asyncio, "run_coroutine_threadsafe", run_now)
+    plugin._gateway_runner = Runner()
+    plugin._gateway_loop = object()
+    plugin._routing = {
+        "platform": "matrix",
+        "chat_id": "!room:example",
+        "chat_type": "dm",
+    }
+
+    # When: the scheduler injects a synthetic wake.
+    delivered = plugin._inject_wake("[heartbeat: job] done")
+
+    # Then: Hermes receives an internal event directly and the adapter only sends the response.
+    assert delivered is True
+    assert len(handled) == 1
+    assert handled[0].internal is True
+    assert handled[0].source.user_id == "system:heartbeat"
+    assert handled[0].text == "[heartbeat: job] done"
+    assert sent == [{"chat_id": "!room:example", "content": "wake accepted"}]
+
+
+def test_inject_wake_fails_when_captured_runner_has_no_handler(monkeypatch: Any) -> None:
+    # Given: a captured route on a runner without Hermes' direct message handler.
+    _install_fake_gateway_modules(monkeypatch)
+
+    class Runner:
+        def __init__(self) -> None:
+            self.adapters = {_FakePlatform.MATRIX: SimpleNamespace()}
+
+    plugin._gateway_runner = Runner()
+    plugin._gateway_loop = object()
+    plugin._routing = {
+        "platform": "matrix",
+        "chat_id": "!room:example",
+        "chat_type": "dm",
+    }
+
+    # When: the scheduler tries to inject a wake.
+    delivered = plugin._inject_wake("[heartbeat: job] done")
+
+    # Then: the plugin reports failure instead of falling back to the adapter busy path.
+    assert delivered is False
 
 
 def test_command_watch_rejects_mcp_tool_name_as_shell_command(tmp_path: Path, monkeypatch: Any) -> None:

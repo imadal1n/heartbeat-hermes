@@ -14,7 +14,7 @@ Watch types:
   first fire.
 
 The wake path reuses the gateway's own synthetic-event pipeline: a
-``MessageEvent(internal=True)`` is handed to the captured platform adapter,
+``MessageEvent(internal=True)`` is handed to the captured gateway runner,
 which routes it through normal dispatch into the agent's active session.
 """
 
@@ -93,7 +93,7 @@ def _resolve_adapter(runner: Any, platform_value: str) -> Any:
 
 
 def _inject_wake(text: str) -> bool:
-    """Hand a synthetic internal event to the captured gateway adapter."""
+    """Hand a synthetic internal event to the captured gateway runner."""
     global _gateway_runner, _gateway_loop
     if not _gateway_runner or not _gateway_loop or not _routing:
         logger.warning("heartbeat: gateway/routing not captured yet, wake dropped: %s", text[:80])
@@ -130,8 +130,19 @@ def _inject_wake(text: str) -> bool:
             logger.error("heartbeat: no adapter for platform %r", platform_value)
             return False
 
+        if not callable(getattr(_gateway_runner, "_handle_message", None)):
+            logger.error("heartbeat: captured gateway runner has no message handler")
+            return False
+
         async def _deliver() -> None:
-            await adapter.handle_message(event)
+            response_text = await _gateway_runner._handle_message(event)
+            if response_text:
+                send_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=response_text,
+                    metadata=send_metadata,
+                )
 
         future = asyncio.run_coroutine_threadsafe(_deliver(), _gateway_loop)
         future.result(timeout=15)
